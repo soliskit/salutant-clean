@@ -1,0 +1,484 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: '0 7 * * 6'
+      timezone: 'America/Los_Angeles'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Push and pull request runs on the same branch replace a run still in
+# progress. Scheduled and manual runs use a separate group so they
+# never cancel or replace push or pull request runs, queued or running
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-weekly' || '' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tests: ${{ steps.counts.outputs.tests }}
+      skipped: ${{ steps.counts.outputs.skipped }}
+      skipped_names: ${{ steps.counts.outputs.skipped_names }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm ci
+      # The measurement files the type gates check import the same pinned
+      # tools provision.mjs installs; --no-save keeps them out of the
+      # package manifest and lockfile, matching the WebKit job. The pins
+      # come from tools.json so they stay single-source, and the composed
+      # name-at-version strings never appear in the tree (logging-hygiene).
+      - run: npm i --no-save $(node -p "const t = require('./tests/measurement/tools.json').tools; Object.entries(t).map(([n, v]) => n + '@' + v).join(' ')")
+      - uses: actions/setup-python@v6
+      - run: pip install ruff==0.17.4
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run typecheck:all
+      - name: Run the tests
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/test-output.txt"
+      - name: Count the tests
+        id: counts
+        if: always()
+        shell: bash
+        run: |
+          count() { grep -E "^(#|ℹ) $1 [0-9]+" "$RUNNER_TEMP/test-output.txt" | tail -n 1 | grep -oE '[0-9]+$' || true; }
+          echo "tests=$(count tests)" >> "$GITHUB_OUTPUT"
+          echo "skipped=$(count skipped)" >> "$GITHUB_OUTPUT"
+          echo "skipped_names=$(grep -E ' # SKIP|^﹣ ' "$RUNNER_TEMP/test-output.txt" | sed -E 's/^ *ok [0-9]+ - //; s/ # SKIP.*//; s/^﹣ //; s/ \([0-9.]+ms\).*$//' | sort | paste -sd'|' -)" >> "$GITHUB_OUTPUT"
+
+  webkit:
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_VERSION: '1.64.1'
+    timeout-minutes: 15
+    outputs:
+      tests: ${{ steps.counts.outputs.tests }}
+      skipped: ${{ steps.counts.outputs.skipped }}
+      skipped_names: ${{ steps.counts.outputs.skipped_names }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm i --no-save "playwright@${PLAYWRIGHT_VERSION}"
+      - run: npx playwright install --with-deps webkit
+      - name: Check Playwright package version
+        run: node -e "process.exit(require('playwright/package.json').version==='1.64.1'?0:1)"
+      - name: Run the WebKit protocol tests
+        shell: bash
+        run: |
+          set -o pipefail
+          SALUTANT_BROWSER=webkit node --test tests/browser-protocol.test.js 2>&1 | tee "$RUNNER_TEMP/webkit-output.txt"
+      - name: Count the WebKit tests
+        id: counts
+        if: always()
+        shell: bash
+        run: |
+          count() { grep -E "^(#|ℹ) $1 [0-9]+" "$RUNNER_TEMP/webkit-output.txt" | tail -n 1 | grep -oE '[0-9]+$' || true; }
+          echo "tests=$(count tests)" >> "$GITHUB_OUTPUT"
+          echo "skipped=$(count skipped)" >> "$GITHUB_OUTPUT"
+          echo "skipped_names=$(grep -E ' # SKIP' "$RUNNER_TEMP/webkit-output.txt" | sed -E 's/^ *ok [0-9]+ - //; s/ # SKIP.*//' | sort | paste -sd'|' -)" >> "$GITHUB_OUTPUT"
+
+  # Final gate. Fails unless the test and webkit jobs succeeded, each ran
+  # at least one test, and skips stay within what is allowed. The test job
+  # may skip exactly the 3 browser tests that need SALUTANT_BROWSER
+  # (tests/browser-protocol.test.js), checked by name. The webkit job may
+  # skip none.
+  # The mutation matrix is not part of this gate.
+  suites-ran:
+    name: Suites ran
+    needs: [test, webkit]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TEST_RESULT: ${{ needs.test.result }}
+          TEST_TESTS: ${{ needs.test.outputs.tests }}
+          TEST_SKIPPED: ${{ needs.test.outputs.skipped }}
+          TEST_SKIPPED_NAMES: ${{ needs.test.outputs.skipped_names }}
+          WEBKIT_RESULT: ${{ needs.webkit.result }}
+          WEBKIT_TESTS: ${{ needs.webkit.outputs.tests }}
+          WEBKIT_SKIPPED: ${{ needs.webkit.outputs.skipped }}
+          WEBKIT_SKIPPED_NAMES: ${{ needs.webkit.outputs.skipped_names }}
+        run: |
+          fail=0
+          check() {
+            name="$1"; result="$2"; tests="${3:-0}"; skipped="${4:-0}"; allowed="$5"
+            echo "$name: result=$result tests=$tests skipped=$skipped (allowed skipped: $allowed)"
+            [ "$result" = success ] || { echo "  $name did not succeed"; fail=1; }
+            [ "$tests" -ge 1 ] || { echo "  $name counted no tests"; fail=1; }
+            [ "$skipped" -le "$allowed" ] || { echo "  $name skipped more than allowed"; fail=1; }
+          }
+          check test "$TEST_RESULT" "$TEST_TESTS" "$TEST_SKIPPED" 3
+          check webkit "$WEBKIT_RESULT" "$WEBKIT_TESTS" "$WEBKIT_SKIPPED" 0
+          # The skipped tests must be exactly the 3 known ones, by name.
+          expected='real browser: a refused final step shows the sign-in failed message and does not navigate|real browser: sign-in works and the browser keeps and returns the service cookie|real browser: the page without its launch parameters fails safe and stays on the page'
+          if [ "$TEST_SKIPPED_NAMES" != "$expected" ]; then
+            echo "  test skipped tests are not the expected three: $TEST_SKIPPED_NAMES"; fail=1
+          fi
+          if [ -n "$WEBKIT_SKIPPED_NAMES" ]; then
+            echo "  webkit skipped tests: $WEBKIT_SKIPPED_NAMES"; fail=1
+          fi
+          exit "$fail"
+
+
+  # Mutation selection: on every pull request, classify each changed path
+  # against the critical set in the case below. A path inside the set runs
+  # every shard. A path outside it does not trigger mutation: it is listed
+  # in the run log and the check summary, and the ordinary checks still
+  # run. A detected rename is classified on both its old and new paths; a
+  # symlink, executable bit, submodule or typechange runs every shard;
+  # additions, deletions and edits classify by path. If the diff itself
+  # cannot be computed the plan job fails instead of guessing.
+  # Scheduled, push and manual runs always get the full matrix; the
+  # weekly schedule is unchanged.
+  plan:
+    name: Mutation plan
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.classify.outputs.verdict }}
+      base_sha: ${{ steps.classify.outputs.base_sha }}
+      merge_base: ${{ steps.classify.outputs.merge_base }}
+      head_sha: ${{ steps.classify.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          # The base branch's full history, so the fork point exists.
+          fetch-depth: 0
+      - id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Not a pull request: full sweep."
+            echo "verdict=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Resolve the moving base ref to a literal SHA, record the literal
+          # fork point and head; only literal SHAs are ever diffed. These
+          # SHAs certify the selection only; the runs check out the pull
+          # request's merge state as before.
+          git fetch --no-tags origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          base_sha=$(git rev-parse "origin/$GITHUB_BASE_REF")
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          echo "base_sha=$base_sha" | tee -a "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" | tee -a "$GITHUB_OUTPUT"
+          if ! git cat-file -e "$head_sha"; then
+            git fetch --no-tags origin "$head_sha"
+          fi
+          if ! merge_base=$(git merge-base "$base_sha" "$head_sha"); then
+            echo "The fork point cannot be resolved; failing closed."
+            exit 1
+          fi
+          echo "merge_base=$merge_base" | tee -a "$GITHUB_OUTPUT"
+          # Trigger set, positively defined: everything the service's
+          # behavior or the mutation verdict depends on - the mutated
+          # sources (src/, including the page markup and styles embedded
+          # in assets.js), the tests, fixtures and tool pins that judge
+          # them (tests/), the gate scripts (scripts/, .github/), and
+          # every build, type, lint, format and deploy configuration
+          # (including .gitignore), and the requirements and adapter
+          # contracts (docs/requirements.md,
+          # docs/mail/mock-mail-adapter-contract.md), which are protected
+          # as contracts whether or not a test reads them. A changed path
+          # outside this set does not trigger mutation: it is listed in
+          # the run log and the check summary, and the ordinary checks
+          # still run. The remaining docs are read by the logging-hygiene
+          # scan, a content gate in the ordinary suite that runs on every
+          # pull request. When a test, script or app process starts
+          # reading a new file, that file joins this set in the same
+          # change. A detected rename is classified on both its old and
+          # new paths; a symlink, executable bit, submodule or typechange
+          # runs the full matrix; adds, deletes and edits classify by
+          # path.
+          # Endpoint delta (the two-endpoint form of A...B): what this pull
+          # request itself changes. --raw -z carries both revisions' modes
+          # and both paths on a rename, NUL-safe. -M keeps rename detection
+          # on; a detected rename classifies the old AND the new path.
+          git diff --raw -z -M "$merge_base" "$head_sha" > "$RUNNER_TEMP/diff.raw"
+          verdict=zero
+          changed=0
+          : > "$RUNNER_TEMP/unmatched.list"
+          classify() {
+            case "$1" in
+              # The positive critical definition: what the service's
+              # behavior or the mutation verdict depends on. A path outside
+              # it does not trigger mutation; it is listed in the run log
+              # and the check summary, and the ordinary checks still run.
+              src/*|tests/*|scripts/*|.github/*) verdict=full ;;
+              package.json|package-lock.json|tsconfig.json|tsconfig.all.json) verdict=full ;;
+              eslint.config.mjs|.prettierrc.json|.prettierignore|ruff.toml|lefthook.yml|wrangler.jsonc) verdict=full ;;
+              docs/requirements.md|docs/mail/mock-mail-adapter-contract.md) verdict=full ;;  # contracts; protected whether or not a test reads them
+              .gitignore) verdict=full ;;
+              *) echo "$1" >> "$RUNNER_TEMP/unmatched.list" ;;
+            esac
+          }
+          while IFS= read -r -d '' meta; do
+            [ -n "$meta" ] || continue
+            IFS= read -r -d '' path1
+            changed=1
+            srcmode=$(echo "$meta" | awk '{print substr($1, 2)}')  # strip the leading colon
+            dstmode=$(echo "$meta" | awk '{print $2}')
+            status=$(echo "$meta" | awk '{print $5}')
+            # Strict rule: a symlink, executable bit, submodule or
+            # typechange is FULL. Adds, deletes and edits classify by path.
+            case "$srcmode $dstmode" in
+              *120000*|*100755*|*160000*) verdict=full ;;
+            esac
+            case "$status" in
+              T*) verdict=full ;;
+            esac
+            case "$status" in
+              R*|C*)
+                IFS= read -r -d '' path2
+                classify "$path1"
+                classify "$path2"
+                ;;
+              *)
+                classify "$path1"
+                ;;
+            esac
+          done < "$RUNNER_TEMP/diff.raw"
+          if [ "$changed" -eq 0 ]; then
+            echo "The pull request changes no files: a legitimate, reported empty diff."
+          fi
+          echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
+          if [ -s "$RUNNER_TEMP/unmatched.list" ]; then
+            if [ "$verdict" = zero ]; then
+              echo "Outside the critical definition (mutation not triggered; the ordinary checks run separately):"
+            else
+              echo "Outside the critical definition (the full run is still triggered for this pull request):"
+            fi
+            while IFS= read -r p; do
+              echo "  $p"
+              echo "::notice title=Outside the critical definition::$p"
+            done < "$RUNNER_TEMP/unmatched.list"
+            {
+              echo '### Paths outside the critical definition'
+              echo ''
+              if [ "$verdict" = zero ]; then
+                echo 'Every changed path is outside the critical definition in this workflow, so no mutation run was triggered.'
+              else
+                echo 'These changed paths are outside the critical definition; the full mutation run is still triggered for this pull request.'
+              fi
+              echo 'The ordinary checks run separately on this pull request. If any of these paths can change behavior under test, add the path to the definition in this workflow.'
+              echo ''
+              while IFS= read -r p; do echo "- \`$p\`"; done < "$RUNNER_TEMP/unmatched.list"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$verdict" = zero ]; then
+            echo "No changed path is in the critical definition: mutation not triggered; the ordinary checks run separately."
+          else
+            echo "Full sweep: every source file; service.js runs as four line-range shards."
+          fi
+
+  mutation:
+    name: mutation (${{ matrix.shard }})
+    needs: plan
+    if: needs.plan.outputs.verdict == 'full'
+    runs-on: ubuntu-latest
+    env:
+      STRYKER_VERSION: '10.1.1'
+    timeout-minutes: ${{ contains(matrix.shard, 'service') && 45 || 30 }}
+    strategy:
+      fail-fast: false
+      # service.js runs as four line-range shards so the wall time follows a
+      # smaller shard instead of the largest file. The ranges are contiguous
+      # from line 1, end with the 99999 sentinel to cover later file growth,
+      # and the AST check below re-verifies coverage before every ranged run:
+      # a mutated node type spanning a boundary fails the job instead of
+      # being silently skipped.
+      matrix:
+        include:
+          - { shard: assets, mutate: src/assets.js }
+          - { shard: crypto, mutate: src/crypto.js }
+          - { shard: headers, mutate: src/headers.js }
+          - { shard: mail-mock, mutate: src/mail-mock.js }
+          - { shard: service-1of4, mutate: 'src/service.js:1-247', shards: '1-247 248-546 547-904 905-99999' }
+          - { shard: service-2of4, mutate: 'src/service.js:248-546', shards: '1-247 248-546 547-904 905-99999' }
+          - { shard: service-3of4, mutate: 'src/service.js:547-904', shards: '1-247 248-546 547-904 905-99999' }
+          - { shard: service-4of4, mutate: 'src/service.js:905-99999', shards: '1-247 248-546 547-904 905-99999' }
+          - { shard: storage, mutate: src/storage.js }
+          - { shard: stub-app, mutate: src/stub-app.js }
+          - { shard: worker, mutate: src/worker.js }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: package.json
+          cache: npm
+      # tsconfig.json stays excluded from the mutation sandbox, matching the
+      # unsharded baseline. Ranged shards run npm ci first so the AST check
+      # below can require espree from the lockfile; that also installs the full
+      # node_modules (including typescript) into those shards' environment, so
+      # the split-vs-unsplit qualification must compare in this same
+      # post-install environment, not against a no-node_modules baseline.
+      - run: npm ci
+        if: contains(matrix.mutate, ':')
+      - name: Verify line-range shards split the file exactly (AST check)
+        if: contains(matrix.mutate, ':')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mutate="${{ matrix.mutate }}"
+          file="${mutate%%:*}"
+          node --input-type=module - "$file" ${{ matrix.shards }} <<'GUARD'
+          // Fail-closed shard-boundary check for line-range mutation shards.
+          // Ranges must be contiguous from line 1 and cover the whole file (last
+          // range ends at EOF or the 99999 sentinel). No mutated-node type may span
+          // a range boundary (a spanning node is silently skipped by every shard);
+          // container types that no mutator targets may span because their children
+          // are still checked. Every range must contain at least one candidate
+          // mutable node (candidate presence is a static source check only - it is
+          // NOT proof of actual mutant generation; that is verified separately by
+          // comparing full mutant-report identities against an unsharded run).
+          import { readFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          const require = createRequire(process.cwd() + '/package.json');
+          const espree = require('espree');
+          const [file, ...ranges] = process.argv.slice(2);
+          const fail = (msg) => {
+            console.error(msg);
+            process.exit(1);
+          };
+          const MAY_SPAN = new Set([
+            'Program',
+            'ImportDeclaration',
+            'ExportNamedDeclaration',
+            'ExportDefaultDeclaration',
+            'ExportAllDeclaration',
+            'ClassDeclaration',
+            'ClassBody',
+            'MethodDefinition',
+            'PropertyDefinition',
+            'StaticBlock',
+            'FunctionDeclaration',
+            'VariableDeclaration',
+            'VariableDeclarator',
+          ]);
+          const source = readFileSync(file, 'utf8');
+          const lineCount = source.split('\n').length - (source.endsWith('\n') ? 1 : 0);
+          const boundaries = [];
+          const rangeList = [];
+          let expectStart = 1;
+          for (const r of ranges) {
+            const m = /^(\d+)-(\d+)$/.exec(r);
+            if (!m) fail(`Bad range "${r}"`);
+            const start = Number(m[1]);
+            const end = Number(m[2]);
+            if (start !== expectStart) fail(`Range gap or overlap at ${start} (expected ${expectStart})`);
+            if (start > lineCount) fail(`Range ${r} starts past end of file (${lineCount} lines)`);
+            if (end !== 99999 && end > lineCount) fail(`Range ${r} ends past end of file`);
+            if (end !== 99999) boundaries.push(end);
+            rangeList.push([start, Math.min(end, lineCount)]);
+            expectStart = end + 1;
+          }
+          // Tail coverage: the last range must reach EOF (fixed end == lineCount, or
+          // the 99999 sentinel which expectStart has already passed lineCount).
+          if (lineCount >= expectStart) {
+            fail(`Tail uncovered: file has ${lineCount} lines but ranges stop at ${expectStart - 1}`);
+          }
+          const ast = espree.parse(source, { ecmaVersion: 'latest', sourceType: 'module', loc: true });
+          const bad = [];
+          const candidates = rangeList.map(() => 0);
+          (function walk(node) {
+            if (!node || typeof node.type !== 'string') return;
+            if (!MAY_SPAN.has(node.type) && node.loc) {
+              for (const b of boundaries) {
+                if (node.loc.start.line <= b && node.loc.end.line >= b + 1) {
+                  bad.push(`${node.type} lines ${node.loc.start.line}-${node.loc.end.line} spans boundary ${b}`);
+                }
+              }
+              const s = node.loc.start.line;
+              const e = node.loc.end.line;
+              for (let i = 0; i < rangeList.length; i++) {
+                if (s >= rangeList[i][0] && e <= rangeList[i][1]) candidates[i]++;
+              }
+            }
+            for (const key of Object.keys(node)) {
+              const v = node[key];
+              if (Array.isArray(v)) v.forEach(walk);
+              else if (v && typeof v === 'object' && key !== 'loc') walk(v);
+            }
+          })(ast);
+          if (bad.length) fail(bad.join('\n'));
+          for (let i = 0; i < rangeList.length; i++) {
+            if (candidates[i] === 0) {
+              fail(`Range ${rangeList[i][0]}-${rangeList[i][1]} contains no candidate mutable nodes (candidate-count check; actual mutant identity is verified separately against an unsharded report)`);
+            }
+          }
+          console.log(`OK ${file}: ${boundaries.length} boundaries, ranges contiguous, tail covered, every range has candidate nodes, no mutable node spans`);
+          GUARD
+      - run: >
+          npx --yes "@stryker-mutator/core@${STRYKER_VERSION}" run
+          --ignorePatterns tsconfig.json
+          --testRunner command
+          --commandRunner.command "exec node --test tests/*.test.js"
+          --mutate "${{ matrix.mutate }}"
+          --reporters ${{ contains(matrix.shard, 'service') && 'clear-text,progress-append-only,dots,json' || 'clear-text,json' }} --coverageAnalysis off
+          --concurrency 1 --timeoutMS 20000
+      # A zero-mutant shard reports NaN score and passes green
+      # (salutant has no thresholds.break configured, so the score never
+      # fails a run), so a drift-emptied range would pass silently.
+      # Fail closed on an empty report for ranged shards. Every shard's report
+      # is fully verified against the generated mutants in the last step.
+      - name: Verify this ranged shard produced mutants
+        if: contains(matrix.mutate, ':')
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync("reports/mutation/mutation.json", "utf8"));
+            const total = Object.values(r.files ?? {}).reduce((n, f) => n + (f.mutants?.length ?? 0), 0);
+            if (total === 0) { console.error("Vacuous shard: mutation report lists 0 mutants"); process.exit(1); }
+            console.log(`Report lists ${total} mutants.`);
+          '
+      # The pinned instrumenter is not a repo dependency: it installs into a
+      # scratch prefix so the shard environment stays as before. The check
+      # compares the report this job produced against the mutants generated for
+      # the shard's range (missing report, missing or unexpected mutant, or a
+      # duplicate fails), verifies the planned ranges together generate exactly
+      # the whole file's mutants for ranged files, requires at least one mutant
+      # Killed by a failing test, and prints status counts with survivor
+      # identities to the job summary. No reports are uploaded.
+      - name: Verify the report against the generated mutants
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm i --prefix "$RUNNER_TEMP/instr" --no-audit --no-fund "@stryker-mutator/instrumenter@${STRYKER_VERSION}"
+          mutate="${{ matrix.mutate }}"
+          file="${mutate%%:*}"
+          args=("$file" reports/mutation/mutation.json)
+          if [[ "$mutate" == *:* ]]; then
+            args+=("${mutate#*:}")
+            for r in ${{ matrix.shards }}; do args+=("$r"); done
+          fi
+          INSTRUMENTER_PREFIX="$RUNNER_TEMP/instr" node scripts/verify-mutation-report.mjs "${args[@]}"
+
