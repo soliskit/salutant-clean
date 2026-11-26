@@ -57,11 +57,75 @@ function* walk(dir) {
   }
 }
 
-// R10 owner-approved public Git attribution exception, exactly three source
-// lines in two guards. These hashes compare the visible, unchanged literals;
-// they do not replace, encode or hide the identity in either guard. No path is
-// skipped, and every non-address secret pattern still checks every byte.
+// R10 exact public Git attribution lines, including the installation tooling.
+// Hashes bind the visible, unchanged literals to exact source lines. They do
+// not replace, encode or hide the identity. No path is skipped, and every
+// non-address secret pattern still checks every byte.
 const PUBLIC_ATTRIBUTION_LINES = [
+  {
+    path: 'docs/credit-protection.md',
+    lineSha256:
+      'aa2df2151a23262c545059f4ecc79bac8a9af8651a7fa76df047dc54f5e82a13',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/commit_entry.py',
+    lineSha256:
+      '67ef83335611d43598ca5ede1997702d531550fbc1336898e96ddddf83ec722f',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/commit_entry.py',
+    lineSha256:
+      'dd978435b3925ad6226a3c133f130fd1196ae41fedbd99e935a321516de8b77b',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/production_policy/policy.py',
+    lineSha256:
+      'cbfae97518a9f26fc0ed77050c29519121039f920bec5c4c70092471ffacec34',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/production_policy/pre-push',
+    lineSha256:
+      '73ee0148a6f549f2aed3e9886257459022bccebe1d86570ab126bcb34183dcc3',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/project_bootstrap/publication_gate.py',
+    lineSha256:
+      '2dd9bf0adcd599745106dc6e879147437d07b549479225868f096f496bdbcdc2',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/project_bootstrap/strict_guard.py',
+    lineSha256:
+      '2dd9bf0adcd599745106dc6e879147437d07b549479225868f096f496bdbcdc2',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
+  {
+    path: 'scripts/credit-protection/project_bootstrap/strict_guard.py',
+    lineSha256:
+      '2c051a54df1e5b7d9c3ca17c586a4de263ce7bf9bfc07670981e7360ee21f0ba',
+    addressSha256:
+      '5f03883e1219e57df95da0cb3add100fc59bbe0c6ef568d354ea39f1bdb26d8d',
+    count: 1
+  },
   {
     path: '.credit-guard/publication_gate.py',
     lineSha256:
